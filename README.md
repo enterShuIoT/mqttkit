@@ -6,22 +6,22 @@
 
 ## 引入模块
 
-模块路径以 `go.mod` 为准，例如：
+模块路径以 `go.mod` 为准：
 
 ```text
-gitlab.enn-sensor.cn/externalsystems/golang/mqttkit.git
+github.com/enterShuIoT/mqttkit
 ```
 
 在业务仓库中使用本地路径时，可在 `go.mod` 中增加：
 
 ```go
-replace gitlab.enn-sensor.cn/externalsystems/golang/mqttkit.git => ./pkg/mqttkit
+replace github.com/enterShuIoT/mqttkit => ./pkg/mqttkit
 ```
 
 然后：
 
 ```bash
-go get gitlab.enn-sensor.cn/externalsystems/golang/mqttkit.git
+go get github.com/enterShuIoT/mqttkit
 ```
 
 ## 最小示例
@@ -110,7 +110,7 @@ _, _ = c.Subscribe(ctx, "device/+/data", 1, func(_ mqtt.Client, m mqtt.Message) 
 
 ## 子包 `proto`
 
-`gitlab.enn-sensor.cn/externalsystems/golang/mqttkit.git/proto` 提供：
+`github.com/enterShuIoT/mqttkit/proto` 提供：
 
 - `Route`：解析后的 Topic 语义片段（由业务定义各字段含义）。
 - `TopicParser`：接口，具体产品协议在**业务仓库**中实现。

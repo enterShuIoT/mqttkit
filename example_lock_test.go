@@ -5,7 +5,7 @@ import (
 	"sync"
 	"testing"
 
-	"gitlab.enn-sensor.cn/externalsystems/golang/mqttkit.git"
+	"github.com/enterShuIoT/mqttkit"
 )
 
 // inProcLocker is a minimal mqttkit.DistributedLocker for tests (single process only).
