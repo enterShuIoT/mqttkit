@@ -1,0 +1,4 @@
+.idea
+*.pyc
+/dee-aid-decision
+.DS_Store
