@@ -8,12 +8,12 @@ import (
 	"github.com/enterShuIoT/mqttkit"
 )
 
-// inProcLocker is a minimal mqttkit.DistributedLocker for tests (single process only).
-// Production: use Redis/etcd/SQL etc. so only one gateway replica handles a device at a time.
+// inProcLocker 是测试用的进程内分布式锁占位实现（非真分布式）。
+// 生产环境请用 Redis/etcd/SQL 等实现 mqttkit.DistributedLocker，保证多副本间互斥。
 type inProcLocker struct {
 	mu sync.Mutex
 	cv sync.Cond
-	n  map[string]int // ref-count per key (re-entrant not supported)
+	n  map[string]int // 每个 key 占用计数（不支持可重入）
 }
 
 func newInProcLocker() *inProcLocker {
@@ -46,6 +46,7 @@ func (l *inProcLocker) Acquire(ctx context.Context, key string) (func(context.Co
 	return release, nil
 }
 
+// TestWithLock_nilLocker 验证 locker 为 nil 时 WithLock 直接执行回调。
 func TestWithLock_nilLocker(t *testing.T) {
 	ctx := context.Background()
 	err := mqttkit.WithLock(ctx, nil, "k", func(ctx context.Context) error { return nil })
@@ -54,6 +55,7 @@ func TestWithLock_nilLocker(t *testing.T) {
 	}
 }
 
+// TestWithLock_inProc 验证 WithLock 与简单锁配合可正常进出临界区。
 func TestWithLock_inProc(t *testing.T) {
 	l := newInProcLocker()
 	ctx := context.Background()

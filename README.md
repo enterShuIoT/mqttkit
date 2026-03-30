@@ -1,24 +1,20 @@
 # mqttkit
 
-基于 [Paho MQTT](https://github.com/eclipse/paho.mqtt.golang) 的 Go MQTT 客户端封装：连接与订阅状态在内部统一排队处理，重连后自动重订阅；支持有界离线发送队列；可选**分布式锁**接口，用于多实例接入网关共享订阅时的**防重复消费**。
+基于 [Paho MQTT](https://github.com/eclipse/paho.mqtt.golang) 的 Go 客户端封装：**单 runLoop 串行处理命令**，Broker 侧的 **`Subscribe` / `Unsubscribe` / `PublishSync` 的长时间等待放到独立 goroutine**，避免一条慢请求占死整条命令队列；重连后对多条订阅**并行** `Subscribe` 以缩短窗口；支持有界离线发布队列。
 
-本库**不包含**具体行业协议（如报文 JSON、Topic 命名规则）；协议解析与示例可在业务项目或独立 demo 模块中实现。子包 `proto` 仅提供与 MQTT Topic 解析相关的通用类型。
+本库**不包含** Topic/报文解析；请在业务或独立协议模块实现。
 
 ## 引入模块
-
-模块路径以 `go.mod` 为准：
 
 ```text
 github.com/enterShuIoT/mqttkit
 ```
 
-在业务仓库中使用本地路径时，可在 `go.mod` 中增加：
+本地替换示例：
 
 ```go
 replace github.com/enterShuIoT/mqttkit => ./pkg/mqttkit
 ```
-
-然后：
 
 ```bash
 go get github.com/enterShuIoT/mqttkit
@@ -43,20 +39,52 @@ if err := c.WaitConnected(ctx); err != nil {
     log.Fatal(err)
 }
 
-unsub, err := c.Subscribe(ctx, "demo/#", 1, func(_ mqtt.Client, m mqtt.Message) {
-    log.Printf("%s %s", m.Topic(), m.Payload())
-})
+// 像 Gin 一样先注册，再统一 Register。
+unsubs, err := mqttkit.NewSubMux().
+    Handle("demo/#", 1, func(_ mqtt.Client, m mqtt.Message) {
+        log.Printf("%s %s", m.Topic(), m.Payload())
+    }).
+    Register(ctx, c)
 if err != nil {
     log.Fatal(err)
 }
-defer unsub()
+defer func() {
+    for _, u := range unsubs {
+        _ = u()
+    }
+}()
 
 if err := c.Publish(ctx, "demo/hello", 1, false, []byte("hi")); err != nil {
     log.Fatal(err)
 }
 ```
 
-> 订阅回调可能在 Paho 的网络协程中执行，请尽快返回；重逻辑请丢到自有 worker 或带缓冲 channel。
+> 订阅回调可能在 Paho 网络路径上执行，请尽快返回；重逻辑投递到自有 worker。
+
+## 订阅洋葱模型（可选）SubEngine
+
+如果你希望把通用逻辑（例如统一耗时统计、统一日志、幂等/加锁编排）写成 middleware，并形成“洋葱链”，可以使用 `mqttkit.SubEngine`：
+
+```go
+unsubs, err := mqttkit.NewSubEngine().
+	Use(func(sc *mqttkit.SubContext) {
+		start := time.Now()
+		sc.Next()
+		log.Printf("handled %s cost=%s", sc.Message.Topic(), time.Since(start))
+	}).
+	Handle("demo/#", 1, func(sc *mqttkit.SubContext) {
+		log.Printf("%s %s", sc.Message.Topic(), sc.Message.Payload())
+	}).
+	Register(ctx, c)
+if err != nil {
+	log.Fatal(err)
+}
+defer func() {
+	for _, u := range unsubs {
+		_ = u()
+	}
+}()
+```
 
 ## 常用配置（Options）
 
@@ -65,55 +93,37 @@ if err := c.Publish(ctx, "demo/hello", 1, false, []byte("hi")); err != nil {
 | `BrokerURLs` | Broker 地址，可多段或在单字符串内用英文逗号分隔 |
 | `ClientID` / `Username` / `Password` | 连接身份 |
 | `TLS` | `*tls.Config`；也可用 `mqttkit.TLSConfigFromPEM("ca.pem")` |
-| `ConnectRetry` / `ConnectTimeout` / `MaxReconnectInterval` | 连接与重连节奏，零值会在 `normalize()` 中改为合理默认 |
-| `AutoReconnect` | `*bool`，`nil` 等价于默认开启自动重连 |
+| `ConnectRetry` / `ConnectTimeout` / `MaxReconnectInterval` | 连接与重连节奏 |
+| `AutoReconnect` | `*bool`，`nil` 时默认开启自动重连 |
 | `CleanSession` | 是否干净会话 |
-| `PublishQueueSize` | 未连接时异步 `Publish` 的排队上限（超限返回 `ErrQueueFull`） |
-| `Locker` | 可选；**Client 不会自动使用**，仅在业务 handler 中与 `WithLock` 等配合 |
+| `PublishQueueSize` | 未连接时异步 `Publish` 的排队上限 |
+| `CmdQueueCap` | 发往 runLoop 的命令通道容量，默认 **2048**（突发大时可调大） |
 | `Logger` | 诊断输出，nil 则静默 |
-
-取消传入 `NewClient` 的 `ctx` 或调用 `Close()` 会结束后台循环并断开连接。
 
 ## 发布：`Publish` 与 `PublishSync`
 
-- **`Publish`**：异步投递；已连接则立即发往 broker；未连接则复制 payload 后排入队列，连上后在 `OnConnect` 后尽快刷出（不等待 Paho token）。
-- **`PublishSync`**：等待 Paho token 完成；**若当前未连接**，返回 `ErrNotConnected`（不会入队）。
+- **`Publish`**：已连接则立即 `Publish`（不等待 token）；未连接则入队，连上后刷出。
+- **`PublishSync`**：在后台等待 Paho token；**调用方仍要等结果**，但 **runLoop 不会被这次等待占住**，其它 Subscribe/Publish 可继续进队处理。未连接时返回 `ErrNotConnected`。
 
-payload 在内部会拷贝，调用方可在返回后安全复用切片。
+单一 **TCP 连接 + 单 Paho Client** 的吞吐仍受 Broker 与 Paho 限制；`PublishSync` 会额外起 goroutine 等 token。海量网关若共用一个 Client，通常还需水平扩展多连接或由 Broker/架构侧分流。
 
-## 多实例网关与分布式锁
+## 分布式锁（仅接口）
 
-多个网关副本若订阅**相同或重叠**的 Topic，同一条消息可能被多个实例各收一次。若希望**同一设备的业务只在一台上处理**（或避免重复写库、重复下发），可在消息处理前按「租户前缀 + 网关副本 ID + 设备 ID」等方式生成锁键，并实现 `mqttkit.DistributedLocker`（Redis、etcd、数据库 advisory lock 等；本库不提供具体实现）。
+多实例服务共享订阅时，可用 **`mqttkit.DistributedLocker`** + **`WithLock`** / **`ConsumerPartitionKey`** 对「同一网关/设备」的处理做互斥。**本库不提供 Redis/etcd 等任何实现**，由业务按自有中间件实现接口后在 handler 里注入使用。
 
 ```go
-locker := myredis.NewLocker(...) // 项目内实现 mqttkit.DistributedLocker
+var locker mqttkit.DistributedLocker = newRedisLocker(...) // 业务实现；nil 表示不加锁
 
-opts := mqttkit.Options{
-    BrokerURLs: []string{"tcp://broker:1883"},
-    ClientID:   "gw-az1-001",
-    Locker:     locker,
-}
-c, _ := mqttkit.NewClient(ctx, opts)
-
-_, _ = c.Subscribe(ctx, "device/+/data", 1, func(_ mqtt.Client, m mqtt.Message) {
-    deviceID := parseDeviceID(m.Topic()) // 业务解析
-    key := mqttkit.ConsumerPartitionKey("acme", opts.ClientID, deviceID)
-
-    _ = mqttkit.WithLock(ctx, c.Locker(), key, func(ctx context.Context) error {
-        return handleOnce(ctx, m) // 仅持锁实例执行核心业务
+mux := mqttkit.NewSubMux().
+    Handle("device/+/data", 1, func(_ mqtt.Client, m mqtt.Message) {
+        deviceID := parseDeviceID(m.Topic())
+        key := mqttkit.ConsumerPartitionKey("acme", instanceID, deviceID)
+        _ = mqttkit.WithLock(ctx, locker, key, func(ctx context.Context) error {
+            return handleOnce(ctx, m)
+        })
     })
-})
+_, _ = mux.Register(ctx, c)
 ```
-
-- **`ConsumerPartitionKey(prefix, gatewayID, deviceID)`**：便于统一键格式；也可完全自建字符串。
-- **`WithLock(ctx, locker, key, fn)`**：`locker == nil` 时直接执行 `fn`，便于单测或单实例部署。
-
-## 子包 `proto`
-
-`github.com/enterShuIoT/mqttkit/proto` 提供：
-
-- `Route`：解析后的 Topic 语义片段（由业务定义各字段含义）。
-- `TopicParser`：接口，具体产品协议在**业务仓库**中实现。
 
 ## 错误变量
 
@@ -125,8 +135,6 @@ _, _ = c.Subscribe(ctx, "device/+/data", 1, func(_ mqtt.Client, m mqtt.Message) 
 | `ErrInvalidOption` | 如未配置 `BrokerURLs` |
 
 ## 开发与测试
-
-若本机执行 `go test` 时出现与动态链接相关的异常，可尝试：
 
 ```bash
 CGO_ENABLED=0 go test ./...

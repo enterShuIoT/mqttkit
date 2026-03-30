@@ -8,12 +8,14 @@ import (
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 )
 
+// subscription 表示一条主题订阅（topic + QoS + Paho 回调）。
 type subscription struct {
 	topic   string
 	qos     byte
 	handler mqtt.MessageHandler
 }
 
+// publishJob 离线队列中的待发消息（已断开连接时的异步 Publish）。
 type publishJob struct {
 	topic    string
 	qos      byte
@@ -21,6 +23,7 @@ type publishJob struct {
 	payload  []byte
 }
 
+// loopState 由 runLoop 与 Paho 回调通过 mu 协调；长时间网络等待放到独立 goroutine，避免占死 runLoop。
 type loopState struct {
 	mu        sync.Mutex
 	subs      map[string]*subscription
@@ -30,6 +33,7 @@ type loopState struct {
 	connected bool
 }
 
+// cmdSubscribe 发往 runLoop 的订阅命令。
 type cmdSubscribe struct {
 	topic   string
 	qos     byte
@@ -42,11 +46,13 @@ type subscribeResult struct {
 	err   error
 }
 
+// cmdUnsubscribe 取消订阅命令。
 type cmdUnsubscribe struct {
 	topic string
 	resCh chan error
 }
 
+// cmdPublish 发布命令；wait 为 true 时对应 PublishSync（结果在后台 goroutine 写入 resCh，不阻塞 runLoop）。
 type cmdPublish struct {
 	topic    string
 	qos      byte
@@ -56,6 +62,7 @@ type cmdPublish struct {
 	resCh    chan error
 }
 
+// runLoop 串行处理命令；Broker 侧的阻塞等待在独立 goroutine 中完成，避免「一台慢操作拖住全局 cmdCh」。
 func (c *Client) runLoop(ctx context.Context) {
 	st := &loopState{
 		subs:   make(map[string]*subscription),
@@ -104,42 +111,70 @@ func (st *loopState) disconnect() {
 	}
 }
 
+// handleSubscribe 更新订阅表；若需向 Broker Subscribe，在后台 goroutine 内 Wait，避免阻塞 runLoop。
 func (c *Client) handleSubscribe(st *loopState, m cmdSubscribe) {
+	topic, qos, handler := m.topic, m.qos, m.handler
+	resCh := m.resCh
+
 	st.mu.Lock()
-	defer st.mu.Unlock()
-	st.subs[m.topic] = &subscription{topic: m.topic, qos: m.qos, handler: m.handler}
-	if st.mqttCli != nil && st.mqttCli.IsConnected() {
-		tok := st.mqttCli.Subscribe(m.topic, m.qos, m.handler)
-		if ok := tok.WaitTimeout(30 * time.Second); ok && tok.Error() != nil {
-			delete(st.subs, m.topic)
-			m.resCh <- subscribeResult{err: tok.Error()}
-			return
-		}
+	st.subs[topic] = &subscription{topic: topic, qos: qos, handler: handler}
+	cli := st.mqttCli
+	conn := st.connected
+	st.mu.Unlock()
+
+	if cli != nil && conn {
+		go func() {
+			tok := cli.Subscribe(topic, qos, handler)
+			var err error
+			if ok := tok.WaitTimeout(30 * time.Second); ok {
+				err = tok.Error()
+			}
+			if err != nil {
+				st.mu.Lock()
+				delete(st.subs, topic)
+				st.mu.Unlock()
+				resCh <- subscribeResult{err: err}
+				return
+			}
+			resCh <- subscribeResult{
+				unsub: func() error { return c.unsubscribe(topic) },
+				err:   nil,
+			}
+		}()
+		return
 	}
-	topic := m.topic
-	m.resCh <- subscribeResult{
+	resCh <- subscribeResult{
 		unsub: func() error { return c.unsubscribe(topic) },
 		err:   nil,
 	}
 }
 
+// handleUnsubscribe 从表删除；Broker Unsubscribe 在后台 goroutine 等待完成。
 func (c *Client) handleUnsubscribe(st *loopState, m cmdUnsubscribe) {
+	topic := m.topic
+	resCh := m.resCh
+
 	st.mu.Lock()
-	delete(st.subs, m.topic)
+	delete(st.subs, topic)
 	cli := st.mqttCli
 	conn := st.connected
 	st.mu.Unlock()
 
-	var err error
 	if cli != nil && conn {
-		tok := cli.Unsubscribe(m.topic)
-		if ok := tok.WaitTimeout(30 * time.Second); ok {
-			err = tok.Error()
-		}
+		go func() {
+			var err error
+			tok := cli.Unsubscribe(topic)
+			if ok := tok.WaitTimeout(30 * time.Second); ok {
+				err = tok.Error()
+			}
+			resCh <- err
+		}()
+		return
 	}
-	m.resCh <- err
+	resCh <- nil
 }
 
+// handlePublish 处理发布；已连接时异步路径由 doPublish 内部决定是否起 goroutine。
 func (c *Client) handlePublish(st *loopState, m cmdPublish) {
 	st.mu.Lock()
 	cli := st.mqttCli
@@ -173,23 +208,30 @@ func (c *Client) handlePublish(st *loopState, m cmdPublish) {
 	}
 }
 
+// doPublish：异步 Publish 立即向 resCh 返回；PublishSync 在 goroutine 内 WaitTimeout，不阻塞 runLoop。
 func (c *Client) doPublish(cli mqtt.Client, m cmdPublish) {
-	tok := cli.Publish(m.topic, m.qos, m.retained, m.payload)
 	if !m.wait {
+		_ = cli.Publish(m.topic, m.qos, m.retained, m.payload)
 		if m.resCh != nil {
 			m.resCh <- nil
 		}
 		return
 	}
-	var err error
-	if ok := tok.WaitTimeout(30 * time.Second); ok {
-		err = tok.Error()
-	}
-	if m.resCh != nil {
-		m.resCh <- err
-	}
+	topic, qos, retained, payload := m.topic, m.qos, m.retained, m.payload
+	resCh := m.resCh
+	go func() {
+		tok := cli.Publish(topic, qos, retained, payload)
+		var err error
+		if ok := tok.WaitTimeout(30 * time.Second); ok {
+			err = tok.Error()
+		}
+		if resCh != nil {
+			resCh <- err
+		}
+	}()
 }
 
+// buildPahoOptions 组装 Paho ClientOptions。OnConnect 内对多条订阅并行 Subscribe+Wait，缩短重连后窗口。
 func (c *Client) buildPahoOptions(st *loopState) *mqtt.ClientOptions {
 	o := mqtt.NewClientOptions()
 	for _, u := range c.opts.BrokerURLs {
@@ -228,12 +270,20 @@ func (c *Client) buildPahoOptions(st *loopState) *mqtt.ClientOptions {
 		st.pending = st.pending[:0]
 		st.mu.Unlock()
 
+		var wg sync.WaitGroup
 		for _, s := range subs {
-			tok := cl.Subscribe(s.topic, s.qos, s.handler)
-			if ok := tok.WaitTimeout(30 * time.Second); ok && tok.Error() != nil {
-				c.opts.Logger.Printf("mqttkit: subscribe %s: %v", s.topic, tok.Error())
-			}
+			s := s
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				tok := cl.Subscribe(s.topic, s.qos, s.handler)
+				if ok := tok.WaitTimeout(30 * time.Second); ok && tok.Error() != nil {
+					c.opts.Logger.Printf("mqttkit: subscribe %s: %v", s.topic, tok.Error())
+				}
+			}()
 		}
+		wg.Wait()
+
 		for _, job := range pending {
 			_ = cl.Publish(job.topic, job.qos, job.retained, job.payload)
 		}
